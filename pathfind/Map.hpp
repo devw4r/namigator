@@ -41,6 +41,12 @@ private:
 
     BVH m_bvhLoader;
 
+    // this is false when the map is based on a global wmo
+    bool m_hasADTs;
+
+    float m_globalWmoOriginX;
+    float m_globalWmoOriginY;
+
     bool m_hasADT[MeshSettings::Adts][MeshSettings::Adts];
     bool m_loadedADT[MeshSettings::Adts][MeshSettings::Adts];
 
@@ -110,6 +116,7 @@ public:
     Map(const std::filesystem::path& dataPath, const std::string& mapName);
 
     bool HasADT(int x, int y) const;
+    bool HasADTs() const;
     bool IsADTLoaded(int x, int y) const;
     bool LoadADT(int x, int y);
     void UnloadADT(int x, int y);
@@ -158,6 +165,11 @@ public:
     bool FindRandomPointAroundCircle(const math::Vertex& centerPosition,
                                      float radius,
                                      math::Vertex& randomPoint) const;
+
+    bool FindPointInBetweenVectors(const math::Vertex& start,
+                                   const math::Vertex& end,
+                                   const float distance,
+                                   math::Vertex& inBetweenPoint) const;
 
     const dtNavMesh& GetNavMesh() const { return m_navMesh; }
     const dtNavMeshQuery& GetNavMeshQuery() const { return m_navQuery; }

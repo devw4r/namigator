@@ -95,7 +95,8 @@ float random_between_0_and_1() {
 namespace pathfind
 {
 Map::Map(const std::filesystem::path& dataPath, const std::string& mapName)
-    : m_dataPath(dataPath), m_bvhLoader(dataPath), m_mapName(mapName)
+    : m_dataPath(dataPath), m_bvhLoader(dataPath), m_mapName(mapName),
+      m_globalWmoOriginX(0.f), m_globalWmoOriginY(0.f)
 {
     utility::BinaryStream in(m_dataPath / (mapName + ".map"));
 
@@ -114,6 +115,8 @@ Map::Map(const std::filesystem::path& dataPath, const std::string& mapName)
 
     if (hasTerrain)
     {
+        m_hasADTs = true;
+
         std::uint8_t has_adt[MeshSettings::Adts * MeshSettings::Adts / 8];
 
         in.ReadBytes(has_adt, sizeof(has_adt));
@@ -204,6 +207,7 @@ Map::Map(const std::filesystem::path& dataPath, const std::string& mapName)
     else
     {
         // no ADTs in this map
+        m_hasADTs = false;
         ::memset(m_hasADT, 0, sizeof(m_hasADT));
 
         WmoFileInstance globalWmo;
@@ -239,15 +243,18 @@ Map::Map(const std::filesystem::path& dataPath, const std::string& mapName)
             (globalWmo.m_bounds.MaxCorner.Y - globalWmo.m_bounds.MinCorner.Y) /
             MeshSettings::TileSize));
 
+        m_globalWmoOriginX = globalWmo.m_bounds.MaxCorner.X;
+        m_globalWmoOriginY = globalWmo.m_bounds.MaxCorner.Y;
+
         params.maxTiles = tileWidth * tileHeight;
         params.maxPolys = 1 << DT_POLY_BITS;
 
         auto const result = m_navMesh.init(&params);
         assert(result == DT_SUCCESS);
 
-        auto const nav_path = m_dataPath / "Nav" / m_mapName / "Map.nav";
+        auto const navPath = m_dataPath / "Nav" / m_mapName / "Map.nav";
 
-        utility::BinaryStream navIn(nav_path);
+        utility::BinaryStream navIn(navPath);
 
         navIn.Decompress();
 
@@ -262,7 +269,7 @@ Map::Map(const std::filesystem::path& dataPath, const std::string& mapName)
 
         for (auto i = 0u; i < header.tileCount; ++i)
         {
-            auto tile = std::make_unique<Tile>(this, navIn, nav_path);
+            auto tile = std::make_unique<Tile>(this, navIn, navPath);
 
             // for a global wmo, all tiles are guarunteed to contain the model
             tile->m_staticWmos.push_back(GlobalWmoId);
@@ -405,6 +412,11 @@ std::shared_ptr<WmoModel> Map::EnsureWmoModelLoaded(const std::string& mpq_path)
     m_loadedWmoModels[bvhFilename] = model;
 
     return model;
+}
+
+bool Map::HasADTs() const
+{
+    return m_hasADTs;
 }
 
 bool Map::HasADT(int x, int y) const
@@ -576,7 +588,15 @@ const Tile* Map::GetTile(float x, float y) const
 {
     // find the tile corresponding to this (x, y)
     int tileX, tileY;
-    math::Convert::WorldToTile({x, y, 0.f}, tileX, tileY);
+
+    // maps based on a global WMO have their tiles positioned differently
+    if (HasADTs())
+        math::Convert::WorldToTile({x, y, 0.f}, tileX, tileY);
+    else
+    {
+        tileX = (m_globalWmoOriginY - y) / MeshSettings::TileSize;
+        tileY = (m_globalWmoOriginX - x) / MeshSettings::TileSize;
+    }
 
     auto const tile = m_tiles.find({tileX, tileY});
 
@@ -720,6 +740,46 @@ bool Map::FindNextZ(const Tile* tile, float x, float y, float zHint,
     return true;
 }
 
+bool Map::FindPointInBetweenVectors(const math::Vertex& start, const math::Vertex& end, 
+                                    const float distance,
+                                    math::Vertex& inBetweenPoint) const
+{
+    const float generalDistance = start.GetDistance(end);
+    if (generalDistance < distance) {
+        return false;
+    }
+
+    const float factor = distance / generalDistance;
+    const float dx = start.X + factor * (end.X - start.X);
+    const float dy = start.Y + factor * (end.Y - start.Y);
+    constexpr float extents[] = {1.f, 1.f, 1.f};
+
+    const math::Vertex v1 {dx, dy, start.Z};
+    const math::Vertex v2 {dx, dy, end.Z};
+
+    float recastMiddle[3];
+    math::Convert::VertexToRecast(v1, recastMiddle);
+
+    dtPolyRef polyRef;
+    if (m_navQuery.findNearestPoly(recastMiddle, extents, &m_queryFilter,
+                                   &polyRef, nullptr) != DT_SUCCESS) {
+        math::Convert::VertexToRecast(v2, recastMiddle);
+        if (m_navQuery.findNearestPoly(recastMiddle, extents, &m_queryFilter,
+                                       &polyRef, nullptr) != DT_SUCCESS) {
+            return false;
+        }
+    }
+
+    float outputPoint[3];
+    if (m_navQuery.closestPointOnPoly(polyRef, recastMiddle, outputPoint, NULL) !=
+        DT_SUCCESS) {
+        return false;
+    }
+
+    math::Convert::VertexToWow(outputPoint, inBetweenPoint);
+    return true;
+}
+
 bool Map::FindRandomPointAroundCircle(const math::Vertex& centerPosition,
                                       const float radius,
                                       math::Vertex& randomPoint) const
@@ -848,19 +908,16 @@ bool Map::ZoneAndArea(const math::Vertex& position, unsigned int& zone,
                       unsigned int& area) const
 {
     // find the tile corresponding to this (x, y)
-    int tileX, tileY;
-    math::Convert::WorldToTile({position.X, position.Y, 0.f}, tileX, tileY);
+    auto const tile = GetTile(position.X, position.Y);
 
-    auto const tile = m_tiles.find({tileX, tileY});
-
-    if (tile == m_tiles.end())
+    if (!tile)
         return false;
 
-    std::vector<const Tile*> tiles {tile->second.get()};
+    std::vector<const Tile*> tiles {tile};
 
     math::Ray ray {
         {position.X, position.Y, position.Z},
-        {position.X, position.Y, tile->second->m_bounds.getMinimum().Z}};
+        {position.X, position.Y, tile->m_bounds.getMinimum().Z}};
 
     unsigned int localZone, localArea;
     auto const rayResult = RayCast(ray, tiles, false, &localZone, &localArea);
@@ -872,9 +929,8 @@ bool Map::ZoneAndArea(const math::Vertex& position, unsigned int& zone,
 
     float adtHeight;
     unsigned int adtZone, adtArea;
-    auto const adtResult =
-        GetADTHeight(tile->second.get(), position.X, position.Y, adtHeight,
-                     &adtZone, &adtArea);
+    auto const adtResult = GetADTHeight(tile, position.X, position.Y, adtHeight,
+                                        &adtZone, &adtArea);
 
     if (adtResult && adtHeight > ray.GetHitPoint().Z)
     {
